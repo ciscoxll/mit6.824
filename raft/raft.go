@@ -1,8 +1,26 @@
 package raft
 
+//
+// this is an outline of the API that raft must expose to
+// the service (or tester). see comments below for
+// each of these functions for more details.
+//
+// rf = Make(...)
+//   create a new Raft server.
+// rf.Start(command interface{}) (index, term, isLeader)
+//   start agreement on a new log entry
+// rf.GetState() (term, isLeader)
+//   ask a Raft for its current term, and whether it thinks it is leader
+// ApplyMsg
+//   each time a new entry is committed to the log, each Raft peer
+//   should send an ApplyMsg to the service (or tester)
+//   in the same server.
+//
+
 import (
 	"bytes"
 	"encoding/gob"
+	"github.com/ciscoxll/mit6.824/labrpc"
 	"log"
 	"math/rand"
 	"sync"
@@ -35,15 +53,10 @@ type LogEntry struct {
 	Term    int
 }
 
-type Config struct {
-	ID    uint64
-	peers []uint64
-}
-
 type raft struct {
 	mu        sync.Mutex
-	peers     []*goraft.ClientEnd
-	persister *goraft.Persister
+	peers     []*labrpc.ClientEnd
+	persister *Persister
 	me        int
 
 	currentTerm int
@@ -294,10 +307,30 @@ func (r *raft) AppendEntries(args AppendEntryArgs, reply *AppendEntryReply) {
 			}
 			reply.Success = false
 		} else if args.Entries != nil {
-
+			// If an existing entry conflicts with a new one (Entry with same index but different terms)
+			// delete the existing entry and all that follow it
+			// reply.CommitIndex is the fucking guy stand for server's log size
+			// r.logger.Printf("Appending %v logs from %v\n", len(args.Entries), args.PrevLogIndex)
+			r.logs = r.logs[:args.PrevLogIndex+1]
+			r.logs = append(r.logs, args.Entries...)
+			if len(r.logs)-1 >= args.LeaderCommit {
+				r.commitIndex = args.LeaderCommit
+				go r.commitLogs()
+			}
+			r.commitIndex = len(r.logs) - 1
+			reply.Success = true
+		} else {
+			// r.logger.Printf("Heartbeat...\n")
+			if len(r.logs)-1 >= args.LeaderCommit {
+				r.commitIndex = args.LeaderCommit
+				go r.commitLogs()
+			}
+			reply.CommitIndex = args.PrevLogIndex
+			reply.Success = true
 		}
 	}
-
+	r.persist()
+	r.resetTimer()
 }
 
 // SendAppendEntryToFollower send append entry to a follower.
@@ -513,7 +546,7 @@ func (r *raft) resetTimer() {
 // for any long-running work.
 //
 
-func Make(peers []*goraft.ClientEnd, me int, persister *goraft.Persister, applyCh chan ApplyMsg) *raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *raft {
 	r := &raft{}
 	r.peers = peers
 	r.persister = persister
