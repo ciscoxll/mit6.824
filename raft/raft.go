@@ -1,4 +1,4 @@
-package goraft
+package raft
 
 import (
 	"bytes"
@@ -42,8 +42,8 @@ type Config struct {
 
 type raft struct {
 	mu        sync.Mutex
-	peers     []*ClientEnd
-	persister *Persister
+	peers     []*goraft.ClientEnd
+	persister *goraft.Persister
 	me        int
 
 	currentTerm int
@@ -68,6 +68,8 @@ type raft struct {
 	applyCh chan ApplyMsg
 	timer   *time.Timer
 }
+
+func (r *raft) hasLeader() bool { return r.lead != None }
 
 // GetState return currentTerm.
 func (r *raft) GetState() (int, bool) {
@@ -499,19 +501,54 @@ func (r *raft) resetTimer() {
 	// r.logger.Printf("Resetting timeout to %v\n", new_timeout)
 }
 
+//
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+
+func Make(peers []*goraft.ClientEnd, me int, persister *goraft.Persister, applyCh chan ApplyMsg) *raft {
+	r := &raft{}
+	r.peers = peers
+	r.persister = persister
+	r.me = me
+
+	// Your initialization code here.
+	r.currentTerm = 0
+	r.voteFor = -1
+	r.logs = make([]LogEntry, 0)
+
+	r.commitIndex = -1
+	r.lastApplied = -1
+
+	r.nextIndex = make([]int, len(peers))
+	r.matchIndex = make([]int, len(peers))
+
+	r.state = FOLLOWER
+	r.applyCh = applyCh
+	// initialize from state persisted before a crash
+	r.readPersist(persister.ReadRaftState())
+
+	/* file, err := os.Create("log" + strconv.Itoa(me) + ".txt")
+	if err != nil {
+		log.Fatal("failed to create log.txt")
+	}
+	r.logger = log.New(file, fmt.Sprintf("[Server %v]", me), log.LstdFlags)
+	*/
+	r.persist()
+	r.resetTimer()
+	return r
+}
+
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		log.Printf(format, a...)
 	}
 	return
 }
-
-func (r *raft) hasLeader() bool { return r.lead != None }
-
-func (r *raft) becomeCandidate() {
-
-}
-
-func (r *raft) becomeFollower(term uint64) {}
-
-func (r *raft) becomeLeader() {}

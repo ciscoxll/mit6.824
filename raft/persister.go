@@ -1,4 +1,4 @@
-package goraft
+package raft
 
 import "sync"
 

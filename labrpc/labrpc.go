@@ -1,4 +1,4 @@
-package goraft
+package labrpc
 
 //
 // channel-based RPC, for 824 labs.
