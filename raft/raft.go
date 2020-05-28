@@ -483,7 +483,7 @@ func (r *raft) handleTimer() {
 		r.voteFor = r.me
 		r.granted_votes_count = 1
 		r.persist()
-		// r.logger.Printf("New election, Candidate:%v term:%v\n", r.me, r.currentTerm)
+		// DPrintf("New election, Candidate:%v term:%v\n", r.me, r.currentTerm)
 		args := RequestVoteArgs{
 			Term:         r.currentTerm,
 			CandidateId:  r.me,
