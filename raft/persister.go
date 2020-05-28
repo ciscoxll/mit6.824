@@ -8,6 +8,19 @@ type Persister struct {
 	snapshot  []byte
 }
 
+func MakePersister() *Persister {
+	return &Persister{}
+}
+
+func (ps *Persister) Copy() *Persister {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	mp := MakePersister()
+	mp.raftstate = ps.raftstate
+	mp.snapshot = ps.snapshot
+	return mp
+}
+
 func (ps *Persister) SaveRaftState(data []byte) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()

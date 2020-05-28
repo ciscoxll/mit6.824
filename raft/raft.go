@@ -191,7 +191,7 @@ func (r *raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = args.Term
 		reply.VoteGranted = (r.voteFor == args.CandidateId)
 		//if reply.VoteGranted {
-		//	r.logger.Printf("Vote for server[%v] at Term:%v\n", rf.me, args.CandidateId, rf.currentTerm)
+		//	r.logger.Printf("Vote for server[%v] at Term:%v\n", r.me, args.CandidateId, r.currentTerm)
 		//}
 		return
 	}
@@ -223,7 +223,7 @@ func (r *raft) handleVoteResult(reply RequestVoteReply) {
 		r.granted_votes_count += 1
 		if r.granted_votes_count >= majority(len(r.peers)) {
 			r.state = LEADER
-			// r.logger.Printf("Leader at Term:%v log_len:%v\n", rf.me, rf.currentTerm, len(rf.logs))
+			// DPrintf("Leader at Term:%v log_len:%v\n", r.me, r.currentTerm, len(r.logs))
 			for i := 0; i < len(r.peers); i++ {
 				if i == r.me {
 					continue
