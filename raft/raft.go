@@ -27,8 +27,9 @@ import (
 	"time"
 )
 
+// Debugging
+const Debug = 0
 const (
-	Debug           int = 0
 	None            int = 0
 	HeartbeatCycle      = time.Millisecond * 50
 	ElectionMinTime     = 150
@@ -349,7 +350,7 @@ func (r *raft) SendAppendEntriesToAllFollower() {
 		args.Term = r.currentTerm
 		args.LeaderId = r.me
 		args.PrevLogIndex = r.nextIndex[i] - 1
-		// r.logger.Printf("prevLogIndx:%v logs_term:%v", args.PrevLogIndex, len(rf.logs))
+		// DPrintf("prevLogIndex:%v logs_term:%v", args.PrevLogIndex, len(r.logs))
 		if args.PrevLogIndex >= 0 {
 			args.PrevLogTerm = r.logs[args.PrevLogIndex].Term
 		}
