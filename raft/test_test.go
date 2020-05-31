@@ -1,521 +1,929 @@
 package raft
 
-import (
-	"github.com/ciscoxll/mit6.824/labrpc"
-	"testing"
-)
-import "strconv"
-import "sync"
-import "runtime"
-import "time"
+//
+// Raft tests.
+//
+// we will use the original test_test.go to test your code for grading.
+// so, while you can modify this code to help you debug, please
+// test with the original before submitting.
+//
+
+import "testing"
 import "fmt"
+import "time"
+import "math/rand"
+import "sync/atomic"
+import "sync"
 
-type JunkArgs struct {
-	X int
-}
-type JunkReply struct {
-	X string
-}
+// The tester generously allows solutions to complete elections in one second
+// (much more than the paper's range of timeouts).
+const RaftElectionTimeout = 1000 * time.Millisecond
 
-type JunkServer struct {
-	mu   sync.Mutex
-	log1 []string
-	log2 []int
-}
+func TestInitialElection(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-func (js *JunkServer) Handler1(args string, reply *int) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	js.log1 = append(js.log1, args)
-	*reply, _ = strconv.Atoi(args)
-}
+	fmt.Printf("Test: initial election ...\n")
 
-func (js *JunkServer) Handler2(args int, reply *string) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	js.log2 = append(js.log2, args)
-	*reply = "handler2-" + strconv.Itoa(args)
-}
+	// is a leader elected?
+	cfg.checkOneLeader()
 
-func (js *JunkServer) Handler3(args int, reply *int) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	time.Sleep(20 * time.Second)
-	*reply = -args
+	// does the leader+term stay the same there is no failure?
+	term1 := cfg.checkTerms()
+	time.Sleep(2 * RaftElectionTimeout)
+	term2 := cfg.checkTerms()
+	if term1 != term2 {
+		fmt.Printf("warning: term changed even though there were no failures")
+	}
+
+	fmt.Printf("  ... Passed\n")
 }
 
-// args is a pointer
-func (js *JunkServer) Handler4(args *JunkArgs, reply *JunkReply) {
-	reply.X = "pointer"
+func TestReElection(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: election after network failure ...\n")
+
+	leader1 := cfg.checkOneLeader()
+
+	// if the leader disconnects, a new one should be elected.
+	cfg.disconnect(leader1)
+	cfg.checkOneLeader()
+
+	// if the old leader rejoins, that shouldn't
+	// disturb the old leader.
+	cfg.connect(leader1)
+	leader2 := cfg.checkOneLeader()
+
+	// if there's no quorum, no leader should
+	// be elected.
+	cfg.disconnect(leader2)
+	cfg.disconnect((leader2 + 1) % servers)
+	time.Sleep(2 * RaftElectionTimeout)
+	cfg.checkNoLeader()
+
+	// if a quorum arises, it should elect a leader.
+	cfg.connect((leader2 + 1) % servers)
+	cfg.checkOneLeader()
+
+	// re-join of last node shouldn't prevent leader from existing.
+	cfg.connect(leader2)
+	cfg.checkOneLeader()
+
+	fmt.Printf("  ... Passed\n")
 }
 
-// args is a not pointer
-func (js *JunkServer) Handler5(args JunkArgs, reply *JunkReply) {
-	reply.X = "no pointer"
-}
+func TestBasicAgree(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-func TestBasic(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+	fmt.Printf("Test: basic agreement ...\n")
 
-	rn := labrpc.MakeNetwork()
+	iters := 3
+	for index := 1; index < iters+1; index++ {
+		nd, _ := cfg.nCommitted(index)
+		if nd > 0 {
+			t.Fatalf("some have committed before Start()")
+		}
 
-	e := rn.MakeEnd("end1-99")
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer("server99", rs)
-
-	rn.Connect("end1-99", "server99")
-	rn.Enable("end1-99", true)
-
-	{
-		reply := ""
-		e.Call("JunkServer.Handler2", 111, &reply)
-		if reply != "handler2-111" {
-			t.Fatalf("wrong reply from Handler2")
+		xindex := cfg.one(index*100, servers)
+		if xindex != index {
+			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
 	}
 
-	{
-		reply := 0
-		e.Call("JunkServer.Handler1", "9099", &reply)
-		if reply != 9099 {
-			t.Fatalf("wrong reply from Handler1")
-		}
-	}
+	fmt.Printf("  ... Passed\n")
 }
 
-func TestTypes(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+func TestFailAgree(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-	rn := labrpc.MakeNetwork()
+	fmt.Printf("Test: agreement despite follower failure ...\n")
 
-	e := rn.MakeEnd("end1-99")
+	cfg.one(101, servers)
 
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
+	// follower network failure
+	leader := cfg.checkOneLeader()
+	cfg.disconnect((leader + 1) % servers)
 
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer("server99", rs)
+	// agree despite one failed server?
+	cfg.one(102, servers-1)
+	cfg.one(103, servers-1)
+	time.Sleep(RaftElectionTimeout)
+	cfg.one(104, servers-1)
+	cfg.one(105, servers-1)
 
-	rn.Connect("end1-99", "server99")
-	rn.Enable("end1-99", true)
+	// failed server re-connected
+	cfg.connect((leader + 1) % servers)
 
-	{
-		var args JunkArgs
-		var reply JunkReply
-		// args must match type (pointer or not) of handler.
-		e.Call("JunkServer.Handler4", &args, &reply)
-		if reply.X != "pointer" {
-			t.Fatalf("wrong reply from Handler4")
-		}
-	}
+	// agree with full set of servers?
+	cfg.one(106, servers)
+	time.Sleep(RaftElectionTimeout)
+	cfg.one(107, servers)
 
-	{
-		var args JunkArgs
-		var reply JunkReply
-		// args must match type (pointer or not) of handler.
-		e.Call("JunkServer.Handler5", args, &reply)
-		if reply.X != "no pointer" {
-			t.Fatalf("wrong reply from Handler5")
-		}
-	}
+	fmt.Printf("  ... Passed\n")
 }
 
-//
-// does net.Enable(endname, false) really disconnect a client?
-//
-func TestDisconnect(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+func TestFailNoAgree(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-	rn := labrpc.MakeNetwork()
+	fmt.Printf("Test: no agreement if too many followers fail ...\n")
 
-	e := rn.MakeEnd("end1-99")
+	cfg.one(10, servers)
 
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
+	// 3 of 5 followers disconnect
+	leader := cfg.checkOneLeader()
+	cfg.disconnect((leader + 1) % servers)
+	cfg.disconnect((leader + 2) % servers)
+	cfg.disconnect((leader + 3) % servers)
 
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer("server99", rs)
-
-	rn.Connect("end1-99", "server99")
-
-	{
-		reply := ""
-		e.Call("JunkServer.Handler2", 111, &reply)
-		if reply != "" {
-			t.Fatalf("unexpected reply from Handler2")
-		}
+	index, _, ok := cfg.rafts[leader].Start(20)
+	if ok != true {
+		t.Fatalf("leader rejected Start()")
+	}
+	if index != 2 {
+		t.Fatalf("expected index 2, got %v", index)
 	}
 
-	rn.Enable("end1-99", true)
+	time.Sleep(2 * RaftElectionTimeout)
 
-	{
-		reply := 0
-		e.Call("JunkServer.Handler1", "9099", &reply)
-		if reply != 9099 {
-			t.Fatalf("wrong reply from Handler1")
-		}
+	n, _ := cfg.nCommitted(index)
+	if n > 0 {
+		t.Fatalf("%v committed but no majority", n)
 	}
+
+	// repair failures
+	cfg.connect((leader + 1) % servers)
+	cfg.connect((leader + 2) % servers)
+	cfg.connect((leader + 3) % servers)
+
+	// the disconnected majority may have chosen a leader from
+	// among their own ranks, forgetting index 2.
+	// or perhaps
+	leader2 := cfg.checkOneLeader()
+	index2, _, ok2 := cfg.rafts[leader2].Start(30)
+	if ok2 == false {
+		t.Fatalf("leader2 rejected Start()")
+	}
+	if index2 < 2 || index2 > 3 {
+		t.Fatalf("unexpected index %v", index2)
+	}
+
+	cfg.one(1000, servers)
+
+	fmt.Printf("  ... Passed\n")
 }
 
-//
-// test net.GetCount()
-//
-func TestCounts(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+func TestConcurrentStarts(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-	rn := labrpc.MakeNetwork()
+	fmt.Printf("Test: concurrent Start()s ...\n")
 
-	e := rn.MakeEnd("end1-99")
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer(99, rs)
-
-	rn.Connect("end1-99", 99)
-	rn.Enable("end1-99", true)
-
-	for i := 0; i < 17; i++ {
-		reply := ""
-		e.Call("JunkServer.Handler2", i, &reply)
-		wanted := "handler2-" + strconv.Itoa(i)
-		if reply != wanted {
-			t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+	var success bool
+loop:
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			// give solution some time to settle
+			time.Sleep(3 * time.Second)
 		}
-	}
 
-	n := rn.GetCount(99)
-	if n != 17 {
-		t.Fatalf("wrong GetCount() %v, expected 17\n", n)
-	}
-}
+		leader := cfg.checkOneLeader()
+		_, term, ok := cfg.rafts[leader].Start(1)
+		if !ok {
+			// leader moved on really quickly
+			continue
+		}
 
-//
-// test RPCs from concurrent ClientEnds
-//
-func TestConcurrentMany(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
-	rn := labrpc.MakeNetwork()
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer(1000, rs)
-
-	ch := make(chan int)
-
-	nclients := 20
-	nrpcs := 10
-	for ii := 0; ii < nclients; ii++ {
-		go func(i int) {
-			n := 0
-			defer func() { ch <- n }()
-
-			e := rn.MakeEnd(i)
-			rn.Connect(i, 1000)
-			rn.Enable(i, true)
-
-			for j := 0; j < nrpcs; j++ {
-				arg := i*100 + j
-				reply := ""
-				e.Call("JunkServer.Handler2", arg, &reply)
-				wanted := "handler2-" + strconv.Itoa(arg)
-				if reply != wanted {
-					t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+		iters := 5
+		var wg sync.WaitGroup
+		is := make(chan int, iters)
+		for ii := 0; ii < iters; ii++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				i, term1, ok := cfg.rafts[leader].Start(100 + i)
+				if term1 != term {
+					return
 				}
-				n += 1
-			}
-		}(ii)
-	}
-
-	total := 0
-	for ii := 0; ii < nclients; ii++ {
-		x := <-ch
-		total += x
-	}
-
-	if total != nclients*nrpcs {
-		t.Fatalf("wrong number of RPCs completed, got %v, expected %v", total, nclients*nrpcs)
-	}
-
-	n := rn.GetCount(1000)
-	if n != total {
-		t.Fatalf("wrong GetCount() %v, expected %v\n", n, total)
-	}
-}
-
-//
-// test unreliable
-//
-func TestUnreliable(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
-	rn := labrpc.MakeNetwork()
-	rn.Reliable(false)
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer(1000, rs)
-
-	ch := make(chan int)
-
-	nclients := 300
-	for ii := 0; ii < nclients; ii++ {
-		go func(i int) {
-			n := 0
-			defer func() { ch <- n }()
-
-			e := rn.MakeEnd(i)
-			rn.Connect(i, 1000)
-			rn.Enable(i, true)
-
-			arg := i * 100
-			reply := ""
-			ok := e.Call("JunkServer.Handler2", arg, &reply)
-			if ok {
-				wanted := "handler2-" + strconv.Itoa(arg)
-				if reply != wanted {
-					t.Fatalf("wrong reply %v from Handler1, expecting %v", reply, wanted)
+				if ok != true {
+					return
 				}
-				n += 1
+				is <- i
+			}(ii)
+		}
+
+		wg.Wait()
+		close(is)
+
+		for j := 0; j < servers; j++ {
+			if t, _ := cfg.rafts[j].GetState(); t != term {
+				// term changed -- can't expect low RPC counts
+				continue loop
 			}
-		}(ii)
-	}
+		}
 
-	total := 0
-	for ii := 0; ii < nclients; ii++ {
-		x := <-ch
-		total += x
-	}
-
-	if total == nclients || total == 0 {
-		t.Fatalf("all RPCs succeeded despite unreliable")
-	}
-}
-
-//
-// test concurrent RPCs from a single ClientEnd
-//
-func TestConcurrentOne(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
-	rn := labrpc.MakeNetwork()
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer(1000, rs)
-
-	e := rn.MakeEnd("c")
-	rn.Connect("c", 1000)
-	rn.Enable("c", true)
-
-	ch := make(chan int)
-
-	nrpcs := 20
-	for ii := 0; ii < nrpcs; ii++ {
-		go func(i int) {
-			n := 0
-			defer func() { ch <- n }()
-
-			arg := 100 + i
-			reply := ""
-			e.Call("JunkServer.Handler2", arg, &reply)
-			wanted := "handler2-" + strconv.Itoa(arg)
-			if reply != wanted {
-				t.Fatalf("wrong reply %v from Handler2, expecting %v", reply, wanted)
+		failed := false
+		cmds := []int{}
+		for index := range is {
+			cmd := cfg.wait(index, servers, term)
+			if ix, ok := cmd.(int); ok {
+				if ix == -1 {
+					// peers have moved on to later terms
+					// so we can't expect all Start()s to
+					// have succeeded
+					failed = true
+					break
+				}
+				cmds = append(cmds, ix)
+			} else {
+				t.Fatalf("value %v is not an int", cmd)
 			}
-			n += 1
-		}(ii)
-	}
+		}
 
-	total := 0
-	for ii := 0; ii < nrpcs; ii++ {
-		x := <-ch
-		total += x
-	}
+		if failed {
+			// avoid leaking goroutines
+			go func() {
+				for range is {
+				}
+			}()
+			continue
+		}
 
-	if total != nrpcs {
-		t.Fatalf("wrong number of RPCs completed, got %v, expected %v", total, nrpcs)
-	}
-
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	if len(js.log2) != nrpcs {
-		t.Fatalf("wrong number of RPCs delivered")
-	}
-
-	n := rn.GetCount(1000)
-	if n != total {
-		t.Fatalf("wrong GetCount() %v, expected %v\n", n, total)
-	}
-}
-
-//
-// regression: an RPC that's delayed during Enabled=false
-// should not delay subsequent RPCs (e.g. after Enabled=true).
-//
-func TestRegression1(t *testing.T) {
-	runtime.GOMAXPROCS(4)
-
-	rn := labrpc.MakeNetwork()
-
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer(1000, rs)
-
-	e := rn.MakeEnd("c")
-	rn.Connect("c", 1000)
-
-	// start some RPCs while the ClientEnd is disabled.
-	// they'll be delayed.
-	rn.Enable("c", false)
-	ch := make(chan bool)
-	nrpcs := 20
-	for ii := 0; ii < nrpcs; ii++ {
-		go func(i int) {
+		for ii := 0; ii < iters; ii++ {
+			x := 100 + ii
 			ok := false
-			defer func() { ch <- ok }()
-
-			arg := 100 + i
-			reply := ""
-			// this call ought to return false.
-			e.Call("JunkServer.Handler2", arg, &reply)
-			ok = true
-		}(ii)
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	// now enable the ClientEnd and check that an RPC completes quickly.
-	t0 := time.Now()
-	rn.Enable("c", true)
-	{
-		arg := 99
-		reply := ""
-		e.Call("JunkServer.Handler2", arg, &reply)
-		wanted := "handler2-" + strconv.Itoa(arg)
-		if reply != wanted {
-			t.Fatalf("wrong reply %v from Handler2, expecting %v", reply, wanted)
+			for j := 0; j < len(cmds); j++ {
+				if cmds[j] == x {
+					ok = true
+				}
+			}
+			if ok == false {
+				t.Fatalf("cmd %v missing in %v", x, cmds)
+			}
 		}
-	}
-	dur := time.Since(t0).Seconds()
 
-	if dur > 0.03 {
-		t.Fatalf("RPC took too long (%v) after Enable", dur)
+		success = true
+		break
 	}
 
-	for ii := 0; ii < nrpcs; ii++ {
-		<-ch
+	if !success {
+		t.Fatalf("term changed too often")
 	}
 
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	if len(js.log2) != 1 {
-		t.Fatalf("wrong number (%v) of RPCs delivered, expected 1", len(js.log2))
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestRejoin(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: rejoin of partitioned leader ...\n")
+
+	cfg.one(101, servers)
+
+	// leader network failure
+	leader1 := cfg.checkOneLeader()
+	cfg.disconnect(leader1)
+
+	// make old leader try to agree on some entries
+	cfg.rafts[leader1].Start(102)
+	cfg.rafts[leader1].Start(103)
+	cfg.rafts[leader1].Start(104)
+
+	// new leader commits, also for index=2
+	cfg.one(103, 2)
+
+	// new leader network failure
+	leader2 := cfg.checkOneLeader()
+	cfg.disconnect(leader2)
+
+	// old leader connected again
+	cfg.connect(leader1)
+
+	cfg.one(104, 2)
+
+	// all together now
+	cfg.connect(leader2)
+
+	cfg.one(105, servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestBackup(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: leader backs up quickly over incorrect follower logs ...\n")
+
+	cfg.one(rand.Int(), servers)
+
+	// put leader and one follower in a partition
+	leader1 := cfg.checkOneLeader()
+	cfg.disconnect((leader1 + 2) % servers)
+	cfg.disconnect((leader1 + 3) % servers)
+	cfg.disconnect((leader1 + 4) % servers)
+
+	// submit lots of commands that won't commit
+	for i := 0; i < 50; i++ {
+		cfg.rafts[leader1].Start(rand.Int())
 	}
 
-	n := rn.GetCount(1000)
-	if n != 1 {
-		t.Fatalf("wrong GetCount() %v, expected %v\n", n, 1)
+	time.Sleep(RaftElectionTimeout / 2)
+
+	cfg.disconnect((leader1 + 0) % servers)
+	cfg.disconnect((leader1 + 1) % servers)
+
+	// allow other partition to recover
+	cfg.connect((leader1 + 2) % servers)
+	cfg.connect((leader1 + 3) % servers)
+	cfg.connect((leader1 + 4) % servers)
+
+	// lots of successful commands to new group.
+	for i := 0; i < 50; i++ {
+		cfg.one(rand.Int(), 3)
 	}
+
+	// now another partitioned leader and one follower
+	leader2 := cfg.checkOneLeader()
+	other := (leader1 + 2) % servers
+	if leader2 == other {
+		other = (leader2 + 1) % servers
+	}
+	cfg.disconnect(other)
+
+	// lots more commands that won't commit
+	for i := 0; i < 50; i++ {
+		cfg.rafts[leader2].Start(rand.Int())
+	}
+
+	time.Sleep(RaftElectionTimeout / 2)
+
+	// bring original leader back to life,
+	for i := 0; i < servers; i++ {
+		cfg.disconnect(i)
+	}
+	cfg.connect((leader1 + 0) % servers)
+	cfg.connect((leader1 + 1) % servers)
+	cfg.connect(other)
+
+	// lots of successful commands to new group.
+	for i := 0; i < 50; i++ {
+		cfg.one(rand.Int(), 3)
+	}
+
+	// now everyone
+	for i := 0; i < servers; i++ {
+		cfg.connect(i)
+	}
+	cfg.one(rand.Int(), servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestCount(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: RPC counts aren't too high ...\n")
+
+	rpcs := func() (n int) {
+		for j := 0; j < servers; j++ {
+			n += cfg.rpcCount(j)
+		}
+		return
+	}
+
+	leader := cfg.checkOneLeader()
+
+	total1 := rpcs()
+
+	if total1 > 30 || total1 < 1 {
+		t.Fatalf("too many or few RPCs (%v) to elect initial leader\n", total1)
+	}
+
+	var total2 int
+	var success bool
+loop:
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			// give solution some time to settle
+			time.Sleep(3 * time.Second)
+		}
+
+		leader = cfg.checkOneLeader()
+		total1 = rpcs()
+
+		iters := 10
+		starti, term, ok := cfg.rafts[leader].Start(1)
+		if !ok {
+			// leader moved on really quickly
+			continue
+		}
+		cmds := []int{}
+		for i := 1; i < iters+2; i++ {
+			x := int(rand.Int31())
+			cmds = append(cmds, x)
+			index1, term1, ok := cfg.rafts[leader].Start(x)
+			if term1 != term {
+				// Term changed while starting
+				continue loop
+			}
+			if !ok {
+				// No longer the leader, so term has changed
+				continue loop
+			}
+			if starti+i != index1 {
+				t.Fatalf("Start() failed")
+			}
+		}
+
+		for i := 1; i < iters+1; i++ {
+			cmd := cfg.wait(starti+i, servers, term)
+			if ix, ok := cmd.(int); ok == false || ix != cmds[i-1] {
+				if ix == -1 {
+					// term changed -- try again
+					continue loop
+				}
+				t.Fatalf("wrong value %v committed for index %v; expected %v\n", cmd, starti+i, cmds)
+			}
+		}
+
+		failed := false
+		total2 = 0
+		for j := 0; j < servers; j++ {
+			if t, _ := cfg.rafts[j].GetState(); t != term {
+				// term changed -- can't expect low RPC counts
+				// need to keep going to update total2
+				failed = true
+			}
+			total2 += cfg.rpcCount(j)
+		}
+
+		if failed {
+			continue loop
+		}
+
+		if total2-total1 > (iters+1+3)*3 {
+			t.Fatalf("too many RPCs (%v) for %v entries\n", total2-total1, iters)
+		}
+
+		success = true
+		break
+	}
+
+	if !success {
+		t.Fatalf("term changed too often")
+	}
+
+	time.Sleep(RaftElectionTimeout)
+
+	total3 := 0
+	for j := 0; j < servers; j++ {
+		total3 += cfg.rpcCount(j)
+	}
+
+	if total3-total2 > 3*20 {
+		t.Fatalf("too many RPCs (%v) for 1 second of idleness\n", total3-total2)
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPersist1(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: basic persistence ...\n")
+
+	cfg.one(11, servers)
+
+	// crash and re-start all
+	for i := 0; i < servers; i++ {
+		cfg.start1(i)
+	}
+	for i := 0; i < servers; i++ {
+		cfg.disconnect(i)
+		cfg.connect(i)
+	}
+
+	cfg.one(12, servers)
+
+	leader1 := cfg.checkOneLeader()
+	cfg.disconnect(leader1)
+	cfg.start1(leader1)
+	cfg.connect(leader1)
+
+	cfg.one(13, servers)
+
+	leader2 := cfg.checkOneLeader()
+	cfg.disconnect(leader2)
+	cfg.one(14, servers-1)
+	cfg.start1(leader2)
+	cfg.connect(leader2)
+
+	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
+
+	i3 := (cfg.checkOneLeader() + 1) % servers
+	cfg.disconnect(i3)
+	cfg.one(15, servers-1)
+	cfg.start1(i3)
+	cfg.connect(i3)
+
+	cfg.one(16, servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPersist2(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: more persistence ...\n")
+
+	index := 1
+	for iters := 0; iters < 5; iters++ {
+		cfg.one(10+index, servers)
+		index++
+
+		leader1 := cfg.checkOneLeader()
+
+		cfg.disconnect((leader1 + 1) % servers)
+		cfg.disconnect((leader1 + 2) % servers)
+
+		cfg.one(10+index, servers-2)
+		index++
+
+		cfg.disconnect((leader1 + 0) % servers)
+		cfg.disconnect((leader1 + 3) % servers)
+		cfg.disconnect((leader1 + 4) % servers)
+
+		cfg.start1((leader1 + 1) % servers)
+		cfg.start1((leader1 + 2) % servers)
+		cfg.connect((leader1 + 1) % servers)
+		cfg.connect((leader1 + 2) % servers)
+
+		time.Sleep(RaftElectionTimeout)
+
+		cfg.start1((leader1 + 3) % servers)
+		cfg.connect((leader1 + 3) % servers)
+
+		cfg.one(10+index, servers-2)
+		index++
+
+		cfg.connect((leader1 + 4) % servers)
+		cfg.connect((leader1 + 0) % servers)
+	}
+
+	cfg.one(1000, servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestPersist3(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: partitioned leader and one follower crash, leader restarts ...\n")
+
+	cfg.one(101, 3)
+
+	leader := cfg.checkOneLeader()
+	cfg.disconnect((leader + 2) % servers)
+
+	cfg.one(102, 2)
+
+	cfg.crash1((leader + 0) % servers)
+	cfg.crash1((leader + 1) % servers)
+	cfg.connect((leader + 2) % servers)
+	cfg.start1((leader + 0) % servers)
+	cfg.connect((leader + 0) % servers)
+
+	cfg.one(103, 2)
+
+	cfg.start1((leader + 1) % servers)
+	cfg.connect((leader + 1) % servers)
+
+	cfg.one(104, servers)
+
+	fmt.Printf("  ... Passed\n")
 }
 
 //
-// if an RPC is stuck in a server, and the server
-// is killed with DeleteServer(), does the RPC
-// get un-stuck?
+// Test the scenarios described in Figure 8 of the extended Raft paper. Each
+// iteration asks a leader, if there is one, to insert a command in the Raft
+// log.  If there is a leader, that leader will fail quickly with a high
+// probability (perhaps without committing the command), or crash after a while
+// with low probability (most likey committing the command).  If the number of
+// alive servers isn't enough to form a majority, perhaps start a new server.
+// The leader in a new term may try to finish replicating log entries that
+// haven't been committed yet.
 //
-func TestKilled(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+func TestFigure8(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
 
-	rn := labrpc.MakeNetwork()
+	fmt.Printf("Test: Figure 8 ...\n")
 
-	e := rn.MakeEnd("end1-99")
+	cfg.one(rand.Int(), 1)
 
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
-
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer("server99", rs)
-
-	rn.Connect("end1-99", "server99")
-	rn.Enable("end1-99", true)
-
-	doneCh := make(chan bool)
-	go func() {
-		reply := 0
-		ok := e.Call("JunkServer.Handler3", 99, &reply)
-		doneCh <- ok
-	}()
-
-	time.Sleep(1000 * time.Millisecond)
-
-	select {
-	case <-doneCh:
-		t.Fatalf("Handler3 should not have returned yet")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	rn.DeleteServer("server99")
-
-	select {
-	case x := <-doneCh:
-		if x != false {
-			t.Fatalf("Handler3 returned successfully despite DeleteServer()")
+	nup := servers
+	for iters := 0; iters < 1000; iters++ {
+		leader := -1
+		for i := 0; i < servers; i++ {
+			if cfg.rafts[i] != nil {
+				_, _, ok := cfg.rafts[i].Start(rand.Int())
+				if ok {
+					leader = i
+				}
+			}
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatalf("Handler3 should return after DeleteServer()")
+
+		if (rand.Int() % 1000) < 100 {
+			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		} else {
+			ms := (rand.Int63() % 13)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+
+		if leader != -1 {
+			cfg.crash1(leader)
+			nup -= 1
+		}
+
+		if nup < 3 {
+			s := rand.Int() % servers
+			if cfg.rafts[s] == nil {
+				cfg.start1(s)
+				cfg.connect(s)
+				nup += 1
+			}
+		}
 	}
+
+	for i := 0; i < servers; i++ {
+		if cfg.rafts[i] == nil {
+			cfg.start1(i)
+			cfg.connect(i)
+		}
+	}
+
+	cfg.one(rand.Int(), servers)
+
+	fmt.Printf("  ... Passed\n")
 }
 
-func TestBenchmark(t *testing.T) {
-	runtime.GOMAXPROCS(4)
+func TestUnreliableAgree(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, true)
+	defer cfg.cleanup()
 
-	rn := labrpc.MakeNetwork()
+	fmt.Printf("Test: unreliable agreement ...\n")
 
-	e := rn.MakeEnd("end1-99")
+	var wg sync.WaitGroup
 
-	js := &JunkServer{}
-	svc := labrpc.MakeService(js)
+	for iters := 1; iters < 50; iters++ {
+		for j := 0; j < 4; j++ {
+			wg.Add(1)
+			go func(iters, j int) {
+				defer wg.Done()
+				cfg.one((100*iters)+j, 1)
+			}(iters, j)
+		}
+		cfg.one(iters, 1)
+	}
 
-	rs := labrpc.MakeServer()
-	rs.AddService(svc)
-	rn.AddServer("server99", rs)
+	cfg.setunreliable(false)
 
-	rn.Connect("end1-99", "server99")
-	rn.Enable("end1-99", true)
+	wg.Wait()
 
-	t0 := time.Now()
-	n := 100000
-	for iters := 0; iters < n; iters++ {
-		reply := ""
-		e.Call("JunkServer.Handler2", 111, &reply)
-		if reply != "handler2-111" {
-			t.Fatalf("wrong reply from Handler2")
+	cfg.one(100, servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestFigure8Unreliable(t *testing.T) {
+	servers := 5
+	cfg := make_config(t, servers, true)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test: Figure 8 (unreliable) ...\n")
+
+	cfg.one(rand.Int()%10000, 1)
+
+	nup := servers
+	for iters := 0; iters < 1000; iters++ {
+		if iters == 200 {
+			cfg.setlongreordering(true)
+		}
+		leader := -1
+		for i := 0; i < servers; i++ {
+			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
+			if ok && cfg.connected[i] {
+				leader = i
+			}
+		}
+
+		if (rand.Int() % 1000) < 100 {
+			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		} else {
+			ms := (rand.Int63() % 13)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+
+		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
+			cfg.disconnect(leader)
+			nup -= 1
+		}
+
+		if nup < 3 {
+			s := rand.Int() % servers
+			if cfg.connected[s] == false {
+				cfg.connect(s)
+				nup += 1
+			}
 		}
 	}
-	fmt.Printf("%v for %v\n", time.Since(t0), n)
-	// march 2016, rtm laptop, 22 microseconds per RPC
+
+	for i := 0; i < servers; i++ {
+		if cfg.connected[i] == false {
+			cfg.connect(i)
+		}
+	}
+
+	cfg.one(rand.Int()%10000, servers)
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func internalChurn(t *testing.T, unreliable bool) {
+
+	if unreliable {
+		fmt.Printf("Test: unreliable churn ...\n")
+	} else {
+		fmt.Printf("Test: churn ...\n")
+	}
+
+	servers := 5
+	cfg := make_config(t, servers, unreliable)
+	defer cfg.cleanup()
+
+	stop := int32(0)
+
+	// create concurrent clients
+	cfn := func(me int, ch chan []int) {
+		var ret []int
+		ret = nil
+		defer func() { ch <- ret }()
+		values := []int{}
+		for atomic.LoadInt32(&stop) == 0 {
+			x := rand.Int()
+			index := -1
+			ok := false
+			for i := 0; i < servers; i++ {
+				// try them all, maybe one of them is a leader
+				cfg.mu.Lock()
+				rf := cfg.rafts[i]
+				cfg.mu.Unlock()
+				if rf != nil {
+					index1, _, ok1 := rf.Start(x)
+					if ok1 {
+						ok = ok1
+						index = index1
+					}
+				}
+			}
+			if ok {
+				// maybe leader will commit our value, maybe not.
+				// but don't wait forever.
+				for _, to := range []int{10, 20, 50, 100, 200} {
+					nd, cmd := cfg.nCommitted(index)
+					if nd > 0 {
+						if xx, ok := cmd.(int); ok {
+							if xx == x {
+								values = append(values, x)
+							}
+						} else {
+							cfg.t.Fatalf("wrong command type")
+						}
+						break
+					}
+					time.Sleep(time.Duration(to) * time.Millisecond)
+				}
+			} else {
+				time.Sleep(time.Duration(79+me*17) * time.Millisecond)
+			}
+		}
+		ret = values
+	}
+
+	ncli := 3
+	cha := []chan []int{}
+	for i := 0; i < ncli; i++ {
+		cha = append(cha, make(chan []int))
+		go cfn(i, cha[i])
+	}
+
+	for iters := 0; iters < 20; iters++ {
+		if (rand.Int() % 1000) < 200 {
+			i := rand.Int() % servers
+			cfg.disconnect(i)
+		}
+
+		if (rand.Int() % 1000) < 500 {
+			i := rand.Int() % servers
+			if cfg.rafts[i] == nil {
+				cfg.start1(i)
+			}
+			cfg.connect(i)
+		}
+
+		if (rand.Int() % 1000) < 200 {
+			i := rand.Int() % servers
+			if cfg.rafts[i] != nil {
+				cfg.crash1(i)
+			}
+		}
+
+		// Make crash/restart infrequent enough that the peers can often
+		// keep up, but not so infrequent that everything has settled
+		// down from one change to the next. Pick a value smaller than
+		// the election timeout, but not hugely smaller.
+		time.Sleep((RaftElectionTimeout * 7) / 10)
+	}
+
+	time.Sleep(RaftElectionTimeout)
+	cfg.setunreliable(false)
+	for i := 0; i < servers; i++ {
+		if cfg.rafts[i] == nil {
+			cfg.start1(i)
+		}
+		cfg.connect(i)
+	}
+
+	atomic.StoreInt32(&stop, 1)
+
+	values := []int{}
+	for i := 0; i < ncli; i++ {
+		vv := <-cha[i]
+		if vv == nil {
+			t.Fatal("client failed")
+		}
+		values = append(values, vv...)
+	}
+
+	time.Sleep(RaftElectionTimeout)
+
+	lastIndex := cfg.one(rand.Int(), servers)
+
+	really := make([]int, lastIndex+1)
+	for index := 1; index <= lastIndex; index++ {
+		v := cfg.wait(index, servers, -1)
+		if vi, ok := v.(int); ok {
+			really = append(really, vi)
+		} else {
+			t.Fatalf("not an int")
+		}
+	}
+
+	for _, v1 := range values {
+		ok := false
+		for _, v2 := range really {
+			if v1 == v2 {
+				ok = true
+			}
+		}
+		if ok == false {
+			cfg.t.Fatalf("didn't find a value")
+		}
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
+
+func TestReliableChurn(t *testing.T) {
+	internalChurn(t, false)
+}
+
+func TestUnreliableChurn(t *testing.T) {
+	internalChurn(t, true)
 }
